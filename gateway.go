@@ -1,173 +1,118 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
-	"encoding/xml"
+	"errors"
 	"flag"
 	"fmt"
+	"gateway/util"
+	"net"
+
+	"gateway/model"
+	"gateway/server"
 	"io/ioutil"
 	"log"
-	"math"
+
 	"net/http"
-	"net/http/httputil"
-	"net/url"
+
 	"strconv"
-	"strings"
+
 	"sync"
 	"time"
 )
 
-var pool = &NodePool{Pool: make(map[string]*Node)}
-var Config Configer
-
-type Node struct {
-	IP             string `xml:"IP"`
-	Port           int    `xml:"Port"`
-	ClientCount    int    `xml:"ClientCount"`
-	MaxClientCount int    `xml:"MaxClientCount"`
-	Enable         bool   `xml:"Enable"`
-	OperationTime  int64
-}
-type GateWay struct {
-	Port  string `xml:"Port"`
-	Nodes []Node `xml:"Node"`
-}
-type Configer struct {
-	GateWay GateWay `xml:"GateWay"`
-}
-
-type GateWayHandle struct {
-}
+var pool = &NodePool{Pool: make(map[string]model.Node)}
+var Config model.Config
 
 type NodePool struct {
 	sync.RWMutex
-	Pool map[string]*Node
+	Pool map[string]model.Node
 }
 
-func (n *NodePool) getMaxAble() *Node {
+/*type UrlInfo struct {
+	Url string
+}*/
 
-	minValueIndex := -1
-	minValue := math.MaxFloat64
+//var cacheData = make(map[string]map[string]UrlInfo)
 
-	for i := 0; i < len(Config.GateWay.Nodes); i++ {
-		mitem := Config.GateWay.Nodes[i]
-
-		if mitem.Enable == true {
-			cminValue := math.Min(minValue, float64(mitem.ClientCount)/float64(mitem.MaxClientCount))
-			if cminValue < minValue {
-				minValueIndex = i
-				minValue = cminValue
-			}
-		}
-	}
-	if minValueIndex == -1 {
-		return &Config.GateWay.Nodes[0] //如果没有可用的服务器时，默认使用第一个
-	} else {
-		return &Config.GateWay.Nodes[minValueIndex]
-	}
-
-}
-func (n *NodePool) getNode(glsessionid string) *Node {
-	n.RLock()
-	defer n.RUnlock()
-	return n.Pool[glsessionid]
-}
-func (n *NodePool) setNode(glsessionid string, node *Node) {
-	n.Lock()
-	defer n.Unlock()
-	n.Pool[glsessionid] = node
-}
-
-func (this *GateWayHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-
-	cookie, err := r.Cookie("GLSESSIONID")
-	var _currentNode *Node
-	if err != nil {
-		_currentNode = pool.getMaxAble()
-		glsessionid := UUID().String() + "." + strings.Replace(_currentNode.IP, ".", "", -1) + ":" + strconv.Itoa(_currentNode.Port)
-		fmt.Println(glsessionid)
-		pool.setNode(glsessionid, _currentNode)
-		http.SetCookie(w, &http.Cookie{Name: "GLSESSIONID", Value: glsessionid, Path: "/"})
-		r.AddCookie(&http.Cookie{Name: "GLSESSIONID", Value: glsessionid, Path: "/"})
-	} else {
-		glsessionid := cookie.Value
-		_currentNode = pool.getNode(glsessionid)
-
-		if _currentNode == nil || _currentNode.Enable == false {
-			_currentNode = pool.getMaxAble()
-			pool.setNode(glsessionid, _currentNode)
-		}
-	}
-
-	if _currentNode == nil || _currentNode.Enable == false {
-
-		w.Header().Add("Content-Type", "text/html")
-		w.Write(infoPage)
-		return
-	}
-
-	if !strings.EqualFold(r.Header.Get("Sec-Websocket-Version"), "") || !strings.EqualFold(r.Header.Get("Sec-Websocket-Key"), "") {
-		remote, err := url.Parse("ws://" + _currentNode.IP + ":" + strconv.Itoa(_currentNode.Port))
-		CheckError(err)
-		proxy := NewSingleHostReverseProxy(remote)
-		proxy.ServeHTTP(w, r)
-		_currentNode.OperationTime = time.Now().Unix()
-	} else {
-		remote, err := url.Parse("http://" + _currentNode.IP + ":" + strconv.Itoa(_currentNode.Port))
-		CheckError(err)
-		proxy := httputil.NewSingleHostReverseProxy(remote)
-		proxy.ServeHTTP(w, r)
-		_currentNode.OperationTime = time.Now().Unix()
-	}
-
-}
-
-var infoPage []byte
+//var infoPage []byte
 
 func init() {
 	var ConfigFile string
-	flag.StringVar(&ConfigFile, "config", "Configer.xml", "config")
+	flag.StringVar(&ConfigFile, "config", "config.json", "config")
 	flag.Parse()
 
 	content, err := ioutil.ReadFile(ConfigFile)
 	if err != nil {
-		panic("缺少配制文件：Configer.xml")
+		panic("缺少配制文件：config.json")
 
 	} else {
-		err = xml.Unmarshal(content, &Config)
-		CheckError(err)
+		//fmt.Println(string(content))
+		err = json.Unmarshal(content, &Config)
+		util.CheckError(err)
 	}
-	infoPage, _ = ioutil.ReadFile("info.html")
+
+	//infoPage, _ = ioutil.ReadFile("info.html")
 }
+
 func main() {
 	http.DefaultClient.Timeout = time.Second * 1
 
-	go runInfo()
-	readAbleServer()
-	go startHttp()
+	//go runInfo()
+	//readAbleServer()
+	//go startHttp()
+	domainMap := Config.GateWay.GetNodesMap()
 
-	h := &GateWayHandle{}
+	h := &server.GateWayHandle{}
+	h.NodesMap = domainMap
 
 	go func() {
 
-		err := http.ListenAndServeTLS(":443", "cas/cert.pem", "cas/key.key", h)
-		CheckError(err)
+		tlsCfg := &tls.Config{
+			GetCertificate: func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
+				node, ok := domainMap[info.ServerName]
+				if ok {
+
+					cert, err := tls.X509KeyPair([]byte(node.CertFile), []byte(node.KeyFile))
+					if err != nil {
+						return nil, err
+					}
+
+					return &cert, nil
+				}
+
+				return nil, errors.New("not exist ca")
+
+			},
+		}
+
+		server := &http.Server{Addr: ":443", Handler: h, TLSConfig: tlsCfg}
+
+		server.ConnState = func(conn net.Conn, state http.ConnState) {
+			fmt.Println(state)
+		}
+
+		err := server.ListenAndServeTLS("", "")
+		util.CheckError(err)
 
 	}()
 
-	Trace("gateway start to " + Config.GateWay.Port)
-	err := http.ListenAndServe(":"+Config.GateWay.Port, h)
+	util.Trace("gateway start to " + strconv.Itoa(Config.GateWay.Port))
+	err := http.ListenAndServe(":"+strconv.Itoa(Config.GateWay.Port), h)
 	if err != nil {
 		log.Fatalln("ListenAndServe: ", err)
 	}
 }
-func startHttp() {
+
+/*func startHttp() {
 	//http.Handle("/status", FrameworkHttp.HttpObject{HandlerFunc: statusAction})
 	http.HandleFunc("/status", statusAction)
 	err := http.ListenAndServe(":9191", nil)
 	log.Println(err)
-}
-func statusAction(Response http.ResponseWriter, Request *http.Request) {
+}*/
+
+/*func statusAction(Response http.ResponseWriter, Request *http.Request) {
 
 	bs := ""
 	for _, v := range Config.GateWay.Nodes {
@@ -180,9 +125,9 @@ func statusAction(Response http.ResponseWriter, Request *http.Request) {
 	bs = `<?xml version="1.0" encoding="UTF-8"?><Nodes>` + bs + `</Nodes>`
 
 	Response.Write([]byte(bs))
-}
+}*/
 
-func readAbleServer() {
+/*func readAbleServer() {
 	go func() {
 		for {
 
@@ -203,9 +148,9 @@ func readAbleServer() {
 			time.Sleep(time.Second * 1)
 		}
 	}()
-}
+}*/
 
-func runInfo() {
+/*func runInfo() {
 
 	for {
 		for i := 0; i < len(Config.GateWay.Nodes); i++ {
@@ -216,9 +161,9 @@ func runInfo() {
 		time.Sleep(time.Second)
 	}
 
-}
+}*/
 
-func requestRuninfo(node *Node) {
+/*func requestRuninfo(node *Node) {
 
 	IPAddress := node.IP + ":" + strconv.Itoa(node.Port)
 
@@ -248,4 +193,4 @@ func requestRuninfo(node *Node) {
 		//CheckError(err)
 	}
 
-}
+}*/
